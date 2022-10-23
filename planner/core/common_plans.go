@@ -796,9 +796,8 @@ func (e *Explain) RenderResult() error {
 			}
 			if pp.SCtx().GetSessionVars().CostModelVersion == modelVer2 {
 				// output cost formula and factor costs through warning under model ver2 and true_card_cost mode for cost calibration.
-				cost, _ := pp.getPlanCostVer2(property.RootTaskType, NewDefaultPlanCostOption())
-				trace := cost.trace
-				pp.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("cost formula: %v", trace.formula))
+				trace, _ := pp.getPlanCostVer2(property.RootTaskType, NewDefaultPlanCostOption())
+				pp.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("cost formula: %v", trace.Formula))
 				data, err := json.Marshal(trace.factorCosts)
 				if err != nil {
 					pp.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("marshal factor costs error %v", err))
@@ -1068,10 +1067,8 @@ func (e *Explain) getOperatorInfo(p Plan, id string) (string, string, string, st
 		estRows = strconv.FormatFloat(pp.getEstRowCountForDisplay(), 'f', 2, 64)
 		if e.ctx != nil && e.ctx.GetSessionVars().CostModelVersion == modelVer2 {
 			costVer2, _ := pp.getPlanCostVer2(property.RootTaskType, NewDefaultPlanCostOption())
-			estCost = strconv.FormatFloat(costVer2.cost, 'f', 2, 64)
-			if costVer2.trace != nil {
-				costFormula = costVer2.trace.formula
-			}
+			estCost = strconv.FormatFloat(costVer2.Cost, 'f', 2, 64)
+			costFormula = costVer2.Formula
 		} else {
 			planCost, _ := getPlanCost(pp, property.RootTaskType, NewDefaultPlanCostOption())
 			estCost = strconv.FormatFloat(planCost, 'f', 2, 64)

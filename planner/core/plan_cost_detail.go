@@ -97,7 +97,7 @@ func setPointGetPlanCostDetail(p *PointGetPlan, opt *physicalOptimizeOp,
 		AddParam(NetworkFactorLbl, networkFactor).
 		AddParam(SeekFactorLbl, seekFactor).
 		SetDesc(fmt.Sprintf("%s*%s+%s", RowSizeLbl, NetworkFactorLbl, SeekFactorLbl))
-	opt.appendPlanCostDetail(detail)
+	//// opt.appendPlanCostDetail(detail)
 }
 
 func setBatchPointGetPlanCostDetail(p *BatchPointGetPlan, opt *physicalOptimizeOp,
@@ -113,7 +113,7 @@ func setBatchPointGetPlanCostDetail(p *BatchPointGetPlan, opt *physicalOptimizeO
 		AddParam(ScanConcurrencyLbl, scanConcurrency).
 		SetDesc(fmt.Sprintf("(%s*%s*%s+%s*%s)/%s",
 			RowCountLbl, RowSizeLbl, NetworkFactorLbl, RowCountLbl, SeekFactorLbl, ScanConcurrencyLbl))
-	opt.appendPlanCostDetail(detail)
+	//// opt.appendPlanCostDetail(detail)
 }
 
 func setPhysicalTableOrIndexScanCostDetail(p PhysicalPlan, opt *physicalOptimizeOp,
@@ -137,7 +137,7 @@ func setPhysicalTableOrIndexScanCostDetail(p PhysicalPlan, opt *physicalOptimize
 		desc = fmt.Sprintf("%s*log2(%s)*%s", RowCountLbl, RowSizeLbl, ScanFactorLbl)
 	}
 	detail.SetDesc(desc)
-	opt.appendPlanCostDetail(detail)
+	// opt.appendPlanCostDetail(detail)
 }
 
 func setPhysicalTableReaderCostDetail(p *PhysicalTableReader, opt *physicalOptimizeOp,
@@ -156,7 +156,7 @@ func setPhysicalTableReaderCostDetail(p *PhysicalTableReader, opt *physicalOptim
 		AddParam(ScanConcurrencyLbl, scanConcurrency)
 	detail.SetDesc(fmt.Sprintf("(%s+%s*%s*%s+%s)/%s", TablePlanCostLbl,
 		RowCountLbl, RowSizeLbl, NetworkFactorLbl, NetSeekCostLbl, ScanConcurrencyLbl))
-	opt.appendPlanCostDetail(detail)
+	// opt.appendPlanCostDetail(detail)
 }
 
 func setPhysicalIndexReaderCostDetail(p *PhysicalIndexReader, opt *physicalOptimizeOp,
@@ -174,7 +174,7 @@ func setPhysicalIndexReaderCostDetail(p *PhysicalIndexReader, opt *physicalOptim
 		AddParam(ScanConcurrencyLbl, scanConcurrency)
 	detail.SetDesc(fmt.Sprintf("(%s+%s*%s*%s+%s)/%s", IndexPlanCostLbl,
 		RowCountLbl, RowSizeLbl, NetworkFactorLbl, NetSeekCostLbl, ScanConcurrencyLbl))
-	opt.appendPlanCostDetail(detail)
+	// opt.appendPlanCostDetail(detail)
 }
 
 func setPhysicalHashJoinCostDetail(p *PhysicalHashJoin, opt *physicalOptimizeOp, spill bool,
@@ -238,7 +238,7 @@ func setPhysicalHashJoinCostDetail(p *PhysicalHashJoin, opt *physicalOptimizeOp,
 		AddParam(ProbeDiskCostDescLbl, diskCostDetail.probeDesc())
 
 	detail.SetDesc(fmt.Sprintf("%s+%s+%s+all children cost", CPUCostDetailLbl, MemCostDetailLbl, DiskCostDetailLbl))
-	opt.appendPlanCostDetail(detail)
+	// opt.appendPlanCostDetail(detail)
 }
 
 // HashJoinProbeCostDetail indicates probe cpu cost detail

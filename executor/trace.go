@@ -168,7 +168,7 @@ func (e *TraceExec) nextOptimizerPlanTrace(ctx context.Context, se sessionctx.Co
 	if err != nil {
 		return errors.AddStack(err)
 	}
-	res := []byte(writer.String())
+	res := []byte(strings.Replace(writer.String(), `\"`, `'`, -1))
 
 	_, err = traceZW.Write(res)
 	if err != nil {

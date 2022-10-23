@@ -338,7 +338,7 @@ type PhysicalPlan interface {
 	getPlanCostVer1(taskType property.TaskType, option *PlanCostOption) (float64, error)
 
 	// getPlanCostVer2 calculates the cost of the plan if it has not been calculated yet and returns the cost on model ver2.
-	getPlanCostVer2(taskType property.TaskType, option *PlanCostOption) (costVer2, error)
+	getPlanCostVer2(taskType property.TaskType, option *PlanCostOption) (CostVer2, error)
 
 	// attach2Task makes the current physical plan as the father of task's physicalPlan and updates the cost of
 	// current task. If the child's task is cop task, some operator may close this task and return a new rootTask.
@@ -434,6 +434,7 @@ func (op *PlanCostOption) WithOptimizeTracer(tracer *physicalOptimizeOp) *PlanCo
 		return nil
 	}
 	op.tracer = tracer
+	op.CostFlag |= CostFlagTrace
 	return op
 }
 
@@ -522,7 +523,7 @@ type basePhysicalPlan struct {
 	// used by the new cost interface
 	planCostInit bool
 	planCost     float64
-	planCostVer2 costVer2
+	planCostVer2 CostVer2
 
 	// probeParents records the IndexJoins and Applys with this operator in their inner children.
 	// Please see comments in PhysicalPlan for details.
