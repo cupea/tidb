@@ -226,6 +226,7 @@ func (p *baseLogicalPlan) enumeratePhysicalPlans4Task(physicalPlans []PhysicalPl
 			if err != nil {
 				return nil, 0, err
 			}
+			child.MoveCandidatesToPhysicalPlan(pp, &tracer.LogicalMap)
 			curCntPlan = curCntPlan * cnt
 			if childTask != nil && childTask.invalid() {
 				break
@@ -466,6 +467,19 @@ func (p *baseLogicalPlan) findBestTask(prop *property.PhysicalProperty, planCoun
 		bestTask = curTask
 		goto END
 	}
+
+	if plansFitsProp != nil {
+		for _, plan := range plansFitsProp {
+			p.AddCandidate(plan)
+		}
+	}
+
+	if plansNeedEnforce != nil {
+		for _, plan := range plansNeedEnforce {
+			p.AddCandidate(plan)
+		}
+	}
+
 	opt.appendCandidate(p, curTask.plan(), prop)
 	if curIsBetter, err := compareTaskCost(p.ctx, curTask, bestTask, opt); err != nil {
 		return nil, 0, err
@@ -924,6 +938,8 @@ func (ds *DataSource) findBestTask(prop *property.PhysicalProperty, planCounter 
 			}
 			appendCandidate(ds, idxMergeTask, prop, opt)
 
+			ds.AddCandidate(idxMergeTask)
+
 			curIsBetter, err := compareTaskCost(ds.ctx, idxMergeTask, t, opt)
 			if err != nil {
 				return nil, 0, err
@@ -1016,6 +1032,7 @@ func (ds *DataSource) findBestTask(prop *property.PhysicalProperty, planCounter 
 					pointGetTask = ds.convertToBatchPointGet(prop, candidate, hashPartColName, opt)
 				}
 				appendCandidate(ds, pointGetTask, prop, opt)
+				ds.AddCandidate(pointGetTask)
 				if !pointGetTask.invalid() {
 					cntPlan++
 					planCounter.Dec(1)
@@ -1054,6 +1071,7 @@ func (ds *DataSource) findBestTask(prop *property.PhysicalProperty, planCounter 
 				planCounter.Dec(1)
 			}
 			appendCandidate(ds, tblTask, prop, opt)
+			ds.AddCandidate(tblTask)
 			curIsBetter, err := compareTaskCost(ds.ctx, tblTask, t, opt)
 			if err != nil {
 				return nil, 0, err
@@ -1079,6 +1097,7 @@ func (ds *DataSource) findBestTask(prop *property.PhysicalProperty, planCounter 
 			planCounter.Dec(1)
 		}
 		appendCandidate(ds, idxTask, prop, opt)
+		ds.AddCandidate(idxTask)
 		curIsBetter, err := compareTaskCost(ds.ctx, idxTask, t, opt)
 		if err != nil {
 			return nil, 0, err

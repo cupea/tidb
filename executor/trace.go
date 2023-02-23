@@ -160,6 +160,8 @@ func (e *TraceExec) nextOptimizerPlanTrace(ctx context.Context, se sessionctx.Co
 		return err
 	}
 
+	se.GetSessionVars().StmtCtx.OptimizeTracer.BuildPhysicalPlanTracing()
+
 	writer := strings.Builder{}
 	jsonEncoder := json.NewEncoder(&writer)
 	// If we do not set this to false, ">", "<", "&"... will be escaped to "\u003c","\u003e", "\u0026"...

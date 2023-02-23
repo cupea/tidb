@@ -453,6 +453,8 @@ type baseLogicalPlan struct {
 	// removing Max1Row operators, and mapping semi-joins to inner-joins.
 	// for now, it's hard to maintain in individual operator, build it from bottom up when using.
 	fdSet *fd.FDSet
+        // used to save candidates physical plan 
+	candidates   []PhysicalPlan
 }
 
 // ExtractFD return the children[0]'s fdSet if there are no adding/removing fd in this logic plan.
@@ -465,6 +467,36 @@ func (p *baseLogicalPlan) ExtractFD() *fd.FDSet {
 		fds.AddFrom(ch.ExtractFD())
 	}
 	return fds
+}
+
+func (p *baseLogicalPlan) AddCandidate(plan PhysicalPlan) {
+	p.candidates = append(p.candidates, plan)
+}
+
+func (p *baseLogicalPlan) GetCandidates() []PhysicalPlan {
+	return p.candidates
+}
+
+func (p *baseLogicalPlan) CopyCandidatesToPhysicalPlan(plan PhysicalPlan) {
+	if lens(p.candidates) == 0 {
+		return
+	}
+	for _, item := range p.candidates {
+		plan.AddCandidate(item)
+	}
+}
+
+func (p *baseLogicalPlan) MoveCandidatesToPhysicalPlan(plan PhysicalPlan, logicMap *map[string]string) {
+	if lens(p.candidates) == 0 {
+		return
+	}
+	for _, item := range p.candidates {
+                if logicalMap != nil {
+			logicalMap[item.TP()+"_"+item.ID()] = p.TP() + "_" + p.ID()
+		}
+		plan.AddCandidate(item)
+	}
+	p.candidates = p.candidates[0:0]
 }
 
 func (p *baseLogicalPlan) MaxOneRow() bool {
@@ -518,6 +550,8 @@ type basePhysicalPlan struct {
 	childrenReqProps []*property.PhysicalProperty
 	self             PhysicalPlan
 	children         []PhysicalPlan
+        // used to save all candidates physical plan
+	candidates       []PhysicalPlan
 
 	// used by the new cost interface
 	planCostInit bool
@@ -570,6 +604,27 @@ func (*basePhysicalPlan) ExplainInfo() string {
 // ExplainNormalizedInfo implements PhysicalPlan interface.
 func (*basePhysicalPlan) ExplainNormalizedInfo() string {
 	return ""
+}
+
+func (p *basePhysicalPlan) AddCandidate(plan PhysicalPlan) {
+	p.candidates = append(p.candidates, plan)
+}
+
+func (p *basePhysicalPlan) GetCandidates() []PhysicalPlan {
+	return p.candidates
+}
+
+func (p *basePhysicalPlan) GenOptimizeTracer(plan PhysicalPlan) {
+	p.candidates = append(p.candidates, plan)
+}
+
+func (p *basePhysicalPlan) AddCandidates(plans []PhysicalPlan) {
+	if lens(plans) == 0 {
+		return
+	}
+	for _, plan := range plans {
+		p.AddCandidate(plan)
+	}
 }
 
 func (p *basePhysicalPlan) GetChildReqProps(idx int) *property.PhysicalProperty {

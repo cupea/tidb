@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/paging"
 	"github.com/pingcap/tipb/go-tipb"
+	"github.com/antonmedv/expr"
 )
 
 // GetPlanCost returns the cost of this plan.
@@ -57,7 +58,7 @@ func (p *basePhysicalPlan) getPlanCostVer2(taskType property.TaskType, option *P
 		childCosts = append(childCosts, childCost)
 	}
 	if len(childCosts) == 0 {
-		p.planCostVer2 = newZeroCostVer2(traceCost(option))
+		p.planCostVer2 = newZeroCostVer2()
 	} else {
 		p.planCostVer2 = sumCostVer2(childCosts...)
 	}
@@ -71,18 +72,21 @@ func (p *PhysicalSelection) getPlanCostVer2(taskType property.TaskType, option *
 	if p.planCostInit && !hasCostFlag(option.CostFlag, CostFlagRecalculate) {
 		return p.planCostVer2, nil
 	}
-
 	inputRows := getCardinality(p.children[0], option.CostFlag)
 	cpuFactor := getTaskCPUFactorVer2(p, taskType)
 
-	filterCost := filterCostVer2(option, inputRows, p.Conditions, cpuFactor)
+	formula := "row_count * " + cpuFactor.Name + " * cond_count"
+	cost := newCostVer2("row_count", inputRows, formula)
+	cost.addParam("cond_count", numFunctions(p.Conditions))
+	cost.CalcCost()
 
 	childCost, err := p.children[0].getPlanCostVer2(taskType, option)
 	if err != nil {
 		return zeroCostVer2, err
 	}
 
-	p.planCostVer2 = sumCostVer2(filterCost, childCost)
+	cost.addCost(childCost)
+	p.planCostVer2 = cost
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -99,14 +103,19 @@ func (p *PhysicalProjection) getPlanCostVer2(taskType property.TaskType, option 
 	cpuFactor := getTaskCPUFactorVer2(p, taskType)
 	concurrency := float64(p.ctx.GetSessionVars().ProjectionConcurrency())
 
-	projCost := filterCostVer2(option, inputRows, p.Exprs, cpuFactor)
+	formula := "row_count * " + cpuFactor.Name + " * expr_count / concurrency"
+	cost := newCostVer2("row_count", inputRows, formula)
+	cost.addParam("expr_count", numFunctions(p.Exprs))
+	cost.addParam("concurrency", concurrency)
+	cost.CalcCost()
 
 	childCost, err := p.children[0].getPlanCostVer2(taskType, option)
 	if err != nil {
 		return zeroCostVer2, err
 	}
 
-	p.planCostVer2 = sumCostVer2(childCost, divCostVer2(projCost, concurrency))
+	cost.addCost(childCost)
+	p.planCostVer2 = cost
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -122,8 +131,17 @@ func (p *PhysicalIndexScan) getPlanCostVer2(taskType property.TaskType, option *
 	rows := getCardinality(p, option.CostFlag)
 	rowSize := math.Max(getAvgRowSize(p.stats, p.schema.Columns), 2.0) // consider all index columns
 	scanFactor := getTaskScanFactorVer2(p, kv.TiKV, taskType)
+	if rowSize < 1 {
+		rowSize = 1
+	}
 
-	p.planCostVer2 = scanCostVer2(option, rows, rowSize, scanFactor)
+	formula := "row_count * " + scanFactor.Name + " * log2_row_size"
+	cost := newCostVer2("row_count", rows, formula)
+	cost.addParam("row_size", rowSize)
+	cost.addParam("log2_row_size", math.Log2(rowSize))
+	cost.CalcCost()
+
+	p.planCostVer2 = cost
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -877,6 +895,67 @@ func (c costVer2Factors) tolist() (l []costVer2Factor) {
 	return append(l, c.TiDBTemp, c.TiKVScan, c.TiKVDescScan, c.TiFlashScan, c.TiDBCPU, c.TiKVCPU, c.TiFlashCPU,
 		c.TiDB2KVNet, c.TiDB2FlashNet, c.TiFlashMPPNet, c.TiDBMem, c.TiKVMem, c.TiFlashMem, c.TiDBDisk, c.TiDBRequest)
 }
+var constFactors map[string]float64
+const (
+	TiDBTemp=      "tidb_temp_table_factor"
+	TiKVScan=      "tikv_scan_factor"
+	TiKVDescScan=  "tikv_desc_scan_factor"
+	TiFlashScan=   "tiflash_scan_factor"
+	TiDBCPU=       "tidb_cpu_factor"
+	TiKVCPU=       "tikv_cpu_factor"
+	TiFlashCPU=    "tiflash_cpu_factor"
+	TiDB2KVNet=    "tidb_kv_net_factor"
+	TiDB2FlashNet= "tidb_flash_net_factor"
+	TiFlashMPPNet= "tiflash_mpp_net_factor"
+	TiDBMem=       "tidb_mem_factor"
+	TiKVMem=       "tikv_mem_factor"
+	TiFlashMem=    "tiflash_mem_factor"
+	TiDBDisk=      "tidb_disk_factor"
+	TiDBRequest=   "tidb_request_factor"
+)
+
+func initFactors() {
+	constFactors = make(map[string]float64,20)
+	constFactors[TiDBTemp] = 0.00
+	constFactors[TiKVScan] = 40.70
+	constFactors[TiKVDescScan] = 61.05
+	constFactors[TiFlashScan] = 11.60
+	constFactors[TiDBCPU] = 49.90
+	constFactors[TiKVCPU] = 49.90
+	constFactors[TiFlashCPU] = 2.40
+	constFactors[TiDB2KVNet] = 3.96
+	constFactors[TiDB2FlashNet] = 2.20
+	constFactors[TiFlashMPPNet] = 1.00
+	constFactors[TiDBMem] = 0.20
+	constFactors[TiKVMem] = 0.20
+	constFactors[TiFlashMem] = 0.05
+	constFactors[TiDBDisk] = 200.00
+	constFactors[TiDBRequest] = 6000000.00
+}
+
+func (c *costVer2) CalcCost() error{
+	c.cost, err := calcFormula(c.trace.formula, c.trace.params)
+	return err
+}
+
+func calcFormula(formula string, params map[string]float64) (float64, error) {
+	env := make(map[string]interface{})
+	for k, v := range constFactors {
+		env[k] = v
+	}
+	for k, v := range params{
+		if _, ok := env[k]; ok { 
+			return 0, errors.New("params: %s duplicated with const factors", k)
+		} else {
+			env[k] = v
+		}
+		result, err := expr.Eval(formula, env)
+		if err != nil {
+			return 0, err
+		}
+		return result, nil
+	}
+}
 
 var defaultVer2Factors = costVer2Factors{
 	TiDBTemp:      costVer2Factor{"tidb_temp_table_factor", 0.00},
@@ -1002,14 +1081,10 @@ func cols2Exprs(cols []*expression.Column) []expression.Expression {
 	return exprs
 }
 
-type costTrace struct {
-	factorCosts map[string]float64 // map[factorName]cost, used to calibrate the cost model
-	formula     string             // It used to trace the cost calculation.
-}
-
 type costVer2 struct {
 	cost  float64
-	trace *costTrace
+	params      map[string]float64 // map[factorName]cost, used to calibrate the cost model
+	formula     string             // It used to trace the cost calculation.
 }
 
 func traceCost(option *PlanCostOption) bool {
@@ -1019,21 +1094,37 @@ func traceCost(option *PlanCostOption) bool {
 	return false
 }
 
-func newZeroCostVer2(trace bool) (ret costVer2) {
-	if trace {
-		ret.trace = &costTrace{make(map[string]float64), ""}
-	}
+func newZeroCostVer2() (ret costVer2) {
+	ret := costTrace{0, make(map[string]float64), ""}
 	return
 }
 
-func newCostVer2(option *PlanCostOption, factor costVer2Factor, cost float64, lazyFormula func() string) (ret costVer2) {
-	ret.cost = cost
-	if traceCost(option) {
-		ret.trace = &costTrace{make(map[string]float64), ""}
-		ret.trace.factorCosts[factor.Name] = cost
-		ret.trace.formula = lazyFormula()
+func newCostVer2(paramName string, cost float64, formula string) (ret costVer2) {
+	ret := costTrace{0, make(map[string]float64), formula}
+	ret.params[paramName] = cost
+	return 
+}
+
+func (c *costVer2)GetCostDetail() (ret PhysicalPlanCostDetail) {
+	for k,v := range c.params {
+		ret.Params[k] = v
 	}
-	return ret
+	ret.BestCost = c.cost
+        //only calc const of itself
+        c.CalcCost()
+	ret.Cost = c.cost
+	ret.Desc = c.formula
+}
+
+func (c *costVer2) addParam(name string, cost float64){
+	c.params[name] = cost
+}
+
+func (c *costVer2) addCost(v costVer2) {
+	if v.cost == 0 {
+		v.CalcCost()
+	}
+	c.cost += v.cost
 }
 
 func sumCostVer2(costs ...costVer2) (ret costVer2) {
@@ -1041,19 +1132,10 @@ func sumCostVer2(costs ...costVer2) (ret costVer2) {
 		return
 	}
 	for i, c := range costs {
-		ret.cost += c.cost
-		if c.trace != nil {
-			if i == 0 { // init
-				ret.trace = &costTrace{make(map[string]float64), ""}
-			}
-			for factor, factorCost := range c.trace.factorCosts {
-				ret.trace.factorCosts[factor] += factorCost
-			}
-			if ret.trace.formula != "" {
-				ret.trace.formula += " + "
-			}
-			ret.trace.formula += "(" + c.trace.formula + ")"
+		if c.cost == 0 {
+			c.CalcCost()
 		}
+		ret.cost += c.cost
 	}
 	return ret
 }

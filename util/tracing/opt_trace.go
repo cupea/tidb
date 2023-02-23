@@ -22,12 +22,12 @@ type PlanTrace struct {
 	TP          string `json:"type"`
 	ProperType  string `json:"property"`
 	// ExplainInfo should be implemented by each implemented Plan
-	ExplainInfo string       `json:"info"`
-	Children    []*PlanTrace `json:"-"`
-	ChildrenID  []int        `json:"children"`
-	ID          int          `json:"id"`
-	Cost        float64      `json:"cost"`
-	Selected    bool         `json:"selected"`
+	ExplainInfo string                 `json:"info"`
+	Children    []*PlanTrace           `json:"-"`
+	ChildrenID  []int                  `json:"children"`
+	ID          int                    `json:"id"`
+	Cost        PhysicalPlanCostDetail `json:"cost"`
+	Selected    bool                   `json:"selected"`
 }
 
 // AppendChildrenID appends children ids
@@ -173,10 +173,12 @@ func DedupCETrace(records []*CETraceRecord) []*CETraceRecord {
 
 // PhysicalOptimizeTracer indicates the trace for the whole physicalOptimize processing
 type PhysicalOptimizeTracer struct {
-	PhysicalPlanCostDetails map[int]*PhysicalPlanCostDetail `json:"costs"`
+	//PhysicalPlanCostDetails map[int]*PhysicalPlanCostDetail `json:"costs"`
 	Candidates              map[int]*CandidatePlanTrace     `json:"candidates"`
 	// final indicates the final physical plan trace
-	Final []*PlanTrace `json:"final"`
+	Final      []*PlanTrace `json:"final"`
+	Root       PhysicalPlan
+	LogicalMap map[string]string
 }
 
 // AppendCandidate appends physical CandidatePlanTrace in tracer.
@@ -187,6 +189,50 @@ func (tracer *PhysicalOptimizeTracer) AppendCandidate(c *CandidatePlanTrace) {
 		return
 	}
 	tracer.Candidates[c.ID] = c
+}
+
+func (p *CandidatePlanTrace) AppendChildren(node *PlanTrace) {
+	p.Children = append(p.Children, node)
+}
+
+func (tracer *PhysicalOptimizeTracer) AppendPlan(l *baseLogicaPlan) {
+	l.MoveCandidatesToPhysicalPlan(tracer.Plan, &tracer.LogicalMap)
+}
+
+func buildChildPlanTracing(parent *PlanTrace, plans []PhysicalPlan, tracer *PhysicalOptimizeTracer) {
+	for _, pp := range plans {
+		c := pp.GetPlanCost()
+		if cost, ok := c.(costVer2); ok {
+			detail := cost.GetCostDetail()
+			detail.TP = pp.TP()
+			detail.ID = pp.ID()
+			mappingLogicalPlan := tracer.LogicalMap[pp.TP()+"_"+pp.ID()]
+			candidate := &CandidatePlanTrace{
+				PlanTrace: &PlanTrace{TP: pp.TP(), ID: pp.ID(),
+					ExplainInfo: pp.ExplainInfo(), ProperType: prop.String()},
+				MappingLogicalPlan: mappingLogicalPlan}
+			buildChildPlanTracing(candidate, pp.Children(), tracer)
+			parent.AppendChildren(candidate)
+		}
+	}
+}
+
+func (tracer *PhysicalOptimizeTracer) BuildPhysicalPlanTracing() {
+	for _, pp := range tracer.Root.GetCandidates() {
+		c := pp.GetPlanCost()
+		if cost, ok := c.(costVer2); ok {
+			detail := cost.GetCostDetail()
+			detail.TP = pp.TP()
+			detail.ID = pp.ID()
+			mappingLogicalPlan := tracer.LogicalMap[pp.TP()+"_"+pp.ID()]
+			candidate := &tracing.CandidatePlanTrace{
+				PlanTrace: &tracing.PlanTrace{TP: pp.TP(), ID: pp.ID(),
+					ExplainInfo: pp.ExplainInfo(), ProperType: prop.String()},
+				MappingLogicalPlan: mappingLogicalPlan}
+			buildChildPlanTracing(candidate, pp.Children(), tracer)
+			tracer.AppendCandidate(candidate)
+		}
+	}
 }
 
 // RecordFinalPlanTrace records final physical plan trace
@@ -248,10 +294,12 @@ func (tracer *OptimizeTracer) RecordFinalPlan(final *PlanTrace) {
 
 // PhysicalPlanCostDetail indicates cost detail
 type PhysicalPlanCostDetail struct {
-	Params map[string]interface{} `json:"params"`
-	TP     string                 `json:"type"`
-	Desc   string                 `json:"desc"`
-	ID     int                    `json:"id"`
+	Params   map[string]interface{} `json:"params"`
+	TP       string                 `json:"type"`
+	Desc     string                 `json:"desc"`
+	ID       int                    `json:"id"`
+	Cost     float64                `json:"cost"`
+	BestCost float64                `json:"best_cost"`
 }
 
 // NewPhysicalPlanCostDetail creates a cost detail
