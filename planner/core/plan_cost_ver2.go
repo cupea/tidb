@@ -17,7 +17,6 @@ package core
 import (
 	"fmt"
 	"math"
-	"strconv"
 
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
@@ -49,9 +48,9 @@ func getPlanCostDetail(p PhysicalPlan, ver2 CostVer2) *tracing.PhysicalPlanCostD
 	costDetail.SetDesc(ver2.Formula)
 	costDetail.Cost = ver2.Cost
 	/*
-	for k, v := range ver2.CostParams {
-		costDetail.AddParam(k, v)
-	}
+		for k, v := range ver2.CostParams {
+			costDetail.AddParam(k, v)
+		}
 	*/
 	return costDetail
 }
@@ -81,26 +80,37 @@ func (p *basePhysicalPlan) getPlanCostVer2(taskType property.TaskType, option *P
 	return p.planCostVer2, nil
 }
 
+func numFunctionsFactor(name string, exprs []expression.Expression) CostItem {
+	num := 0.0
+	for _, e := range exprs {
+		if _, ok := e.(*expression.ScalarFunction); ok {
+			num++
+		} else { // Column and Constant
+			num += 0.01 // an empirical value
+		}
+	}
+	return newCostItem(name, num)
+}
+
 // getPlanCostVer2 returns the plan-cost of this sub-plan, which is:
 // plan-cost = child-cost + filter-cost
 func (p *PhysicalSelection) getPlanCostVer2(taskType property.TaskType, option *PlanCostOption) (CostVer2, error) {
 	if p.planCostInit && !hasCostFlag(option.CostFlag, CostFlagRecalculate) {
 		return p.planCostVer2, nil
 	}
-	inputRows := getCardinality(p.children[0], option.CostFlag)
+	inputRows := newCostItem("rows", getCardinality(p.children[0], option.CostFlag))
+	builder := newCostBuilder(inputRows)
 	cpuFactor := getTaskCPUFactorVer2(p, taskType)
 
-	cost := newNamedCostVer2(p.ExplainID().String(), "row_count", inputRows)
-	cost.addParam("cond_count", numFunctions(p.Conditions))
-	cost.Mul(cpuFactor.Name).Mul("cond_count")
+	builder.mul(numFunctionsFactor("filter", p.Conditions)).mul(cpuFactor)
 
 	childCost, err := p.children[0].getPlanCostVer2(taskType, option)
 	if err != nil {
 		return zeroCostVer2, err
 	}
 
-	cost.PlusC(&childCost)
-	p.planCostVer2 = cost
+	builder.plus(childCost).setName(p.ExplainID().String())
+	p.planCostVer2 = builder.value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -113,22 +123,20 @@ func (p *PhysicalProjection) getPlanCostVer2(taskType property.TaskType, option 
 		return p.planCostVer2, nil
 	}
 
-	inputRows := getCardinality(p.children[0], option.CostFlag)
+	inputRows := newCostItem("rows", getCardinality(p.children[0], option.CostFlag))
 	cpuFactor := getTaskCPUFactorVer2(p, taskType)
-	concurrency := float64(p.ctx.GetSessionVars().ProjectionConcurrency())
+	concurrency := newCostItem("concurrency", float64(p.ctx.GetSessionVars().ProjectionConcurrency()))
+	builder := newCostBuilder(inputRows)
 
-	cost := newNamedCostVer2(p.ExplainID().String(), "row_count", inputRows)
-	cost.addParam("expr_count", numFunctions(p.Exprs))
-	cost.addParam("concurrency", concurrency)
-	cost.Mul(cpuFactor.Name).Mul("expr_count").Div("concurrency")
+	builder.mul(numFunctionsFactor("expr_count", p.Exprs)).mul(cpuFactor).div(concurrency)
 
 	childCost, err := p.children[0].getPlanCostVer2(taskType, option)
 	if err != nil {
 		return zeroCostVer2, err
 	}
 
-	cost.PlusC(&childCost)
-	p.planCostVer2 = cost
+	builder.plus(childCost).setName(p.ExplainID().String())
+	p.planCostVer2 = builder.value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -141,19 +149,17 @@ func (p *PhysicalIndexScan) getPlanCostVer2(taskType property.TaskType, option *
 		return p.planCostVer2, nil
 	}
 
-	rows := getCardinality(p, option.CostFlag)
 	rowSize := math.Max(getAvgRowSize(p.stats, p.schema.Columns), 2.0) // consider all index columns
-	scanFactor := getTaskScanFactorVer2(p, kv.TiKV, taskType)
 	if rowSize < 1 {
 		rowSize = 1
 	}
+	rowSizeCost := newCostItem("row_size", math.Log2(rowSize))
+	inputRows := newCostItem("rows", getCardinality(p.children[0], option.CostFlag))
+	builder := newCostBuilder(inputRows)
+	scanFactor := getTaskScanFactorVer2(p, kv.TiKV, taskType)
+	builder.mul(scanFactor).mul(rowSizeCost).setName(p.ExplainID().String())
 
-	cost := newNamedCostVer2(p.ExplainID().String(), "row_count", rows)
-	cost.addParam("row_size", rowSize)
-	cost.addParam("log2_row_size", math.Log2(rowSize))
-	cost.Mul(scanFactor.Name).Mul("log2_row_size")
-
-	p.planCostVer2 = cost
+	p.planCostVer2 = builder.value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -166,23 +172,27 @@ func (p *PhysicalTableScan) getPlanCostVer2(taskType property.TaskType, option *
 		return p.planCostVer2, nil
 	}
 
-	rows := getCardinality(p, option.CostFlag)
+	rows := newCostItem("rows", getCardinality(p, option.CostFlag))
 	var rowSize float64
 	if p.StoreType == kv.TiKV {
 		rowSize = getAvgRowSize(p.stats, p.tblCols) // consider all columns if TiKV
 	} else { // TiFlash
 		rowSize = getAvgRowSize(p.stats, p.schema.Columns)
 	}
-	rowSize = math.Max(rowSize, 2.0)
+	rowSizeCost := newCostItem("log_row_size", math.Log2(math.Max(rowSize, 2.0)))
 	scanFactor := getTaskScanFactorVer2(p, p.StoreType, taskType)
-
-	p.planCostVer2 = scanCostVer2(option, rows, rowSize, scanFactor)
+	builder := newCostBuilder(rows)
+	builder.mul(rowSizeCost).mul(scanFactor)
 
 	// give TiFlash a start-up cost to let the optimizer prefers to use TiKV to process small table scans.
 	if p.StoreType == kv.TiFlash {
-		p.planCostVer2 = sumCostVer2(p.planCostVer2, scanCostVer2(option, 10000, rowSize, scanFactor))
+		nrows := newCostItem("10000", 10000)
+		nbuilder := newCostBuilder(nrows)
+		nbuilder.mul(rowSizeCost).mul(scanFactor)
+		builder.plus(nbuilder.curr)
 	}
-
+	builder.setName(p.ExplainID().String())
+	p.planCostVer2 = builder.value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -287,7 +297,7 @@ func (p *PhysicalIndexLookUpReader) getPlanCostVer2(taskType property.TaskType, 
 	tableSideCost := divCostVer2(sumCostVer2(tableNetCost, tableChildCost), distConcurrency)
 
 	doubleReadRows := indexRows
-	doubleReadCPUCost := newCostVer2(option, cpuFactor,
+	doubleReadCPUCost := newOldCostVer2(option, cpuFactor,
 		indexRows*cpuFactor.Value,
 		func() string { return fmt.Sprintf("double-read-cpu(%v*%v)", doubleReadRows, cpuFactor) })
 	batchSize := float64(p.ctx.GetSessionVars().IndexLookupSize)
@@ -383,15 +393,15 @@ func (p *PhysicalSort) getPlanCostVer2(taskType property.TaskType, option *PlanC
 
 	var sortMemCost, sortDiskCost CostVer2
 	if !spill {
-		sortMemCost = newCostVer2(option, memFactor,
+		sortMemCost = newOldCostVer2(option, memFactor,
 			rows*rowSize*memFactor.Value,
 			func() string { return fmt.Sprintf("sortMem(%v*%v*%v)", rows, rowSize, memFactor) })
 		sortDiskCost = zeroCostVer2
 	} else {
-		sortMemCost = newCostVer2(option, memFactor,
+		sortMemCost = newOldCostVer2(option, memFactor,
 			float64(memQuota)*memFactor.Value,
 			func() string { return fmt.Sprintf("sortMem(%v*%v)", memQuota, memFactor) })
-		sortDiskCost = newCostVer2(option, diskFactor,
+		sortDiskCost = newOldCostVer2(option, diskFactor,
 			rows*rowSize*diskFactor.Value,
 			func() string { return fmt.Sprintf("sortDisk(%v*%v*%v)", rows, rowSize, diskFactor) })
 	}
@@ -422,7 +432,7 @@ func (p *PhysicalTopN) getPlanCostVer2(taskType property.TaskType, option *PlanC
 	memFactor := getTaskMemFactorVer2(p, taskType)
 
 	topNCPUCost := orderCostVer2(option, rows, N, p.ByItems, cpuFactor)
-	topNMemCost := newCostVer2(option, memFactor,
+	topNMemCost := newOldCostVer2(option, memFactor,
 		N*rowSize*memFactor.Value,
 		func() string { return fmt.Sprintf("topMem(%v*%v*%v)", N, rowSize, memFactor) })
 
@@ -477,7 +487,7 @@ func (p *PhysicalHashAgg) getPlanCostVer2(taskType property.TaskType, option *Pl
 	groupCost := groupCostVer2(option, inputRows, p.GroupByItems, cpuFactor)
 	hashBuildCost := hashBuildCostVer2(option, outputRows, outputRowSize, float64(len(p.GroupByItems)), cpuFactor, memFactor)
 	hashProbeCost := hashProbeCostVer2(option, inputRows, float64(len(p.GroupByItems)), cpuFactor)
-	startCost := newCostVer2(option, cpuFactor,
+	startCost := newOldCostVer2(option, cpuFactor,
 		10*3*cpuFactor.Value, // 10rows * 3func * cpuFactor
 		func() string { return fmt.Sprintf("cpu(10*3*%v)", cpuFactor) })
 
@@ -537,34 +547,28 @@ func (p *PhysicalHashJoin) getPlanCostVer2(taskType property.TaskType, option *P
 		build, probe = probe, build
 		buildFilters, probeFilters = probeFilters, buildFilters
 	}
-	buildRows := getCardinality(build, option.CostFlag)
-	probeRows := getCardinality(probe, option.CostFlag)
-	buildRowSize := getAvgRowSize(build.Stats(), build.Schema().Columns)
-	tidbConcurrency := float64(p.Concurrency)
-	mppConcurrency := float64(3) // TODO: remove this empirical value
+	buildRows := newCostItem("build_rows", getCardinality(build, option.CostFlag))
+	probeRows := newCostItem("probe_rows", getCardinality(probe, option.CostFlag))
+	buildRowSize := newCostItem("build_row_size", getAvgRowSize(build.Stats(), build.Schema().Columns))
+	tidbConcurrency := newCostItem("tidb_concurrency", float64(p.Concurrency))
+	mppConcurrency := newCostItem("mpp_concurrency", float64(3)) // TODO: remove this empirical value
 	cpuFactor := getTaskCPUFactorVer2(p, taskType)
 	memFactor := getTaskMemFactorVer2(p, taskType)
 
-	buildFilterCost := filterNamedCostVer2("buildFilterCost", option, buildRows, buildFilters, cpuFactor)
-	/*
-	buildFilterCost:= newCostVer2("buildFilterCost","build_row_count", buildRows)
-	buildFilterCost.addParam("build_filter_count", numFunctions(buildFilters))
-	buildFilterCost.Mul("build_filter_count").Mul(cpuFactor.Name)
-	*/
+	builder := newCostBuilder(buildRows)
+	builder.mul(cpuFactor).mul(newCostItem("build_filter_count", numFunctions(buildFilters))).setName("buildFilterCost")
 
-	buildHashCost:= newNamedCostVer2("buildHashCost","build_row_count", buildRows)
-	buildHashCost.addParam("build_row_size", buildRowSize)
-	buildHashCost.addParam("build_key_count", float64(len(buildKeys)))
-	buildHashCost.Mul("build_key_count").Mul(cpuFactor.Name).Plus("build_row_count").Mul("build_row_size").Mul(memFactor.Name).Plus("build_row_count").Mul(cpuFactor.Name)
+	hashBuilder := newCostBuilder(buildRows)
+	hashBuilder.mul(cpuFactor).mul(newCostItem("build_key_count", float64(len(buildKeys))))
+	hashBuilder.plus(buildRows).mul(buildRowSize).mul(memFactor)
+	hashBuilder.plus(buildRows).mul(cpuFactor).setName("buildHashCost")
 
-	probeFilterCost := newNamedCostVer2("probeFilterCost","probe_row_count", probeRows)
-	probeFilterCost.addParam("probe_filter_count", numFunctions(probeFilters))
-	probeFilterCost.Mul("probe_filter_count").Mul(cpuFactor.Name)
+	probeFilterBuilder := newCostBuilder(probeRows)
+	probeFilterBuilder.mul(newCostItem("probe_filter_count", numFunctions(probeFilters))).mul(cpuFactor).setName("probeFilterCost")
 
-	probeHashCost := newNamedCostVer2("probeHashCost","probe_row_count", probeRows)
-	probeHashCost.addParam("probe_key_count", float64(len(probeKeys)))
-	buildHashCost.Mul("probe_key_count").Mul(cpuFactor.Name).Plus("probe_row_count").Mul(cpuFactor.Name)
-	
+	probeHashBuilder := newCostBuilder(probeRows)
+	probeHashBuilder.mul(newCostItem("probe_key_count", float64(len(probeKeys)))).mul(cpuFactor).plus(probeRows).mul(cpuFactor).setName("probeHashCost")
+
 	buildChildCost, err := build.getPlanCostVer2(taskType, option)
 	if err != nil {
 		return zeroCostVer2, err
@@ -574,21 +578,15 @@ func (p *PhysicalHashJoin) getPlanCostVer2(taskType property.TaskType, option *P
 		return zeroCostVer2, err
 	}
 
-	finalCost := newCostVer2WithSubCost(p.ExplainID().String(), nil)
 	if taskType == property.MppTaskType { // BCast or Shuffle Join, use mppConcurrency
-		probeCost := newCostVer2WithSubCost("probeCost", &buildHashCost)
-		probeCost.addParam("mpp_concurrency", mppConcurrency)
-		probeCost.PlusC(&buildFilterCost).PlusC(&probeHashCost).PlusC(&probeFilterCost).DivAll("mpp_concurrency")
-		finalCost.PlusC(&buildChildCost).PlusC(&probeChildCost).PlusC(&probeCost)
-		p.planCostVer2 = finalCost
+		builder.sumAll(hashBuilder.curr, probeFilterBuilder.curr, probeHashBuilder.curr).divA(mppConcurrency).setName("probeCost").sumAll(buildChildCost, probeChildCost).setName(p.ExplainID().String())
+		p.planCostVer2 = builder.value()
 	} else { // TiDB HashJoin
-		probeCost := newCostVer2WithSubCost("probeCost", &probeFilterCost)
-		probeCost.addParam("tidb_concurrency", tidbConcurrency)
-		probeCost.PlusC(&probeHashCost).DivAll("tidb_concurrency")
-		startCost := newNamedCostVer2("startCost", cpuFactor.Name, cpuFactor.Value)
-		startCost.Mul("10").Mul("3")
-		finalCost.PlusC(&startCost).PlusC(&buildChildCost).PlusC(&probeChildCost).PlusC(&buildHashCost).PlusC(&buildFilterCost).PlusC(&probeCost)
-		p.planCostVer2 = finalCost
+		probeFilterBuilder.plus(probeHashBuilder.curr).divA(tidbConcurrency).setName("probeCost")
+		startCostBuilder := newCostBuilder(cpuFactor)
+		startCostBuilder.mul(newCostItem("10", 10)).mul(newCostItem("3", 3)).setName("startCost")
+		probeFilterBuilder.sumAll(startCostBuilder.curr, buildChildCost, probeChildCost, hashBuilder.curr, builder.curr).setName(p.ExplainID().String())
+		p.planCostVer2 = probeFilterBuilder.value()
 	}
 	p.planCostInit = true
 	return p.planCostVer2, nil
@@ -616,10 +614,10 @@ func (p *PhysicalIndexJoin) getIndexJoinCostVer2(taskType property.TaskType, opt
 	if err != nil {
 		return zeroCostVer2, err
 	}
-	buildTaskCost := newCostVer2(option, cpuFactor,
+	buildTaskCost := newOldCostVer2(option, cpuFactor,
 		buildRows*10*cpuFactor.Value,
 		func() string { return fmt.Sprintf("cpu(%v*10*%v)", buildRows, cpuFactor) })
-	startCost := newCostVer2(option, cpuFactor,
+	startCost := newOldCostVer2(option, cpuFactor,
 		10*3*cpuFactor.Value,
 		func() string { return fmt.Sprintf("cpu(10*3*%v)", cpuFactor) })
 
@@ -802,34 +800,27 @@ func scanCostVer2(option *PlanCostOption, rows, rowSize float64, scanFactor Cost
 	if rowSize < 1 {
 		rowSize = 1
 	}
-	return newCostVer2(option, scanFactor,
+	return newOldCostVer2(option, scanFactor,
 		// rows * log(row-size) * scanFactor, log2 from experiments
 		rows*math.Log2(rowSize)*scanFactor.Value,
 		func() string { return fmt.Sprintf("scan(%v*logrowsize(%v)*%v)", rows, rowSize, scanFactor) })
 }
 
 func netCostVer2(option *PlanCostOption, rows, rowSize float64, netFactor CostVer2Factor) CostVer2 {
-	return newCostVer2(option, netFactor,
+	return newOldCostVer2(option, netFactor,
 		rows*rowSize*netFactor.Value,
 		func() string { return fmt.Sprintf("net(%v*rowsize(%v)*%v)", rows, rowSize, netFactor) })
 }
 
-func filterNamedCostVer2(name string, option *PlanCostOption, rows float64, filters []expression.Expression, cpuFactor CostVer2Factor) CostVer2 {
-	buildFilterCost:= newNamedCostVer2(name,"row_count", rows)
-	buildFilterCost.addParam("filter_count", numFunctions(filters))
-	buildFilterCost.Mul("filter_count").Mul(cpuFactor.Name)
-	return buildFilterCost
-}
-
 func filterCostVer2(option *PlanCostOption, rows float64, filters []expression.Expression, cpuFactor CostVer2Factor) CostVer2 {
 	numFuncs := numFunctions(filters)
-	return newCostVer2(option, cpuFactor,
+	return newOldCostVer2(option, cpuFactor,
 		rows*numFuncs*cpuFactor.Value,
 		func() string { return fmt.Sprintf("cpu(%v*filters(%v)*%v)", rows, numFuncs, cpuFactor) })
 }
 
 func aggCostVer2(option *PlanCostOption, rows float64, aggFuncs []*aggregation.AggFuncDesc, cpuFactor CostVer2Factor) CostVer2 {
-	return newCostVer2(option, cpuFactor,
+	return newOldCostVer2(option, cpuFactor,
 		// TODO: consider types of agg-funcs
 		rows*float64(len(aggFuncs))*cpuFactor.Value,
 		func() string { return fmt.Sprintf("agg(%v*aggs(%v)*%v)", rows, len(aggFuncs), cpuFactor) })
@@ -837,7 +828,7 @@ func aggCostVer2(option *PlanCostOption, rows float64, aggFuncs []*aggregation.A
 
 func groupCostVer2(option *PlanCostOption, rows float64, groupItems []expression.Expression, cpuFactor CostVer2Factor) CostVer2 {
 	numFuncs := numFunctions(groupItems)
-	return newCostVer2(option, cpuFactor,
+	return newOldCostVer2(option, cpuFactor,
 		rows*numFuncs*cpuFactor.Value,
 		func() string { return fmt.Sprintf("group(%v*cols(%v)*%v)", rows, numFuncs, cpuFactor) })
 }
@@ -861,10 +852,10 @@ func orderCostVer2(option *PlanCostOption, rows, N float64, byItems []*util.ByIt
 			numFuncs++
 		}
 	}
-	exprCost := newCostVer2(option, cpuFactor,
+	exprCost := newOldCostVer2(option, cpuFactor,
 		rows*float64(numFuncs)*cpuFactor.Value,
 		func() string { return fmt.Sprintf("exprCPU(%v*%v*%v)", rows, numFuncs, cpuFactor) })
-	orderCost := newCostVer2(option, cpuFactor,
+	orderCost := newOldCostVer2(option, cpuFactor,
 		rows*math.Log2(N)*cpuFactor.Value,
 		func() string { return fmt.Sprintf("orderCPU(%v*log(%v)*%v)", rows, N, cpuFactor) })
 	return sumCostVer2(exprCost, orderCost)
@@ -872,13 +863,13 @@ func orderCostVer2(option *PlanCostOption, rows, N float64, byItems []*util.ByIt
 
 func hashBuildCostVer2(option *PlanCostOption, buildRows, buildRowSize, nKeys float64, cpuFactor, memFactor CostVer2Factor) CostVer2 {
 	// TODO: 1) consider types of keys, 2) dedicated factor for build-probe hash table
-	hashKeyCost := newCostVer2(option, cpuFactor,
+	hashKeyCost := newOldCostVer2(option, cpuFactor,
 		buildRows*nKeys*cpuFactor.Value,
 		func() string { return fmt.Sprintf("hashkey(%v*%v*%v)", buildRows, nKeys, cpuFactor) })
-	hashMemCost := newCostVer2(option, memFactor,
+	hashMemCost := newOldCostVer2(option, memFactor,
 		buildRows*buildRowSize*memFactor.Value,
 		func() string { return fmt.Sprintf("hashmem(%v*%v*%v)", buildRows, buildRowSize, memFactor) })
-	hashBuildCost := newCostVer2(option, cpuFactor,
+	hashBuildCost := newOldCostVer2(option, cpuFactor,
 		buildRows*cpuFactor.Value,
 		func() string { return fmt.Sprintf("hashbuild(%v*%v)", buildRows, cpuFactor) })
 	return sumCostVer2(hashKeyCost, hashMemCost, hashBuildCost)
@@ -886,10 +877,10 @@ func hashBuildCostVer2(option *PlanCostOption, buildRows, buildRowSize, nKeys fl
 
 func hashProbeCostVer2(option *PlanCostOption, probeRows, nKeys float64, cpuFactor CostVer2Factor) CostVer2 {
 	// TODO: 1) consider types of keys, 2) dedicated factor for build-probe hash table
-	hashKeyCost := newCostVer2(option, cpuFactor,
+	hashKeyCost := newOldCostVer2(option, cpuFactor,
 		probeRows*nKeys*cpuFactor.Value,
 		func() string { return fmt.Sprintf("hashkey(%v*%v*%v)", probeRows, nKeys, cpuFactor) })
-	hashProbeCost := newCostVer2(option, cpuFactor,
+	hashProbeCost := newOldCostVer2(option, cpuFactor,
 		probeRows*cpuFactor.Value,
 		func() string { return fmt.Sprintf("hashprobe(%v*%v)", probeRows, cpuFactor) })
 	return sumCostVer2(hashKeyCost, hashProbeCost)
@@ -897,14 +888,37 @@ func hashProbeCostVer2(option *PlanCostOption, probeRows, nKeys float64, cpuFact
 
 // For simplicity and robust, only operators that need double-read like IndexLookup and IndexJoin consider this cost.
 func doubleReadCostVer2(option *PlanCostOption, numTasks float64, requestFactor CostVer2Factor) CostVer2 {
-	return newCostVer2(option, requestFactor,
+	return newOldCostVer2(option, requestFactor,
 		numTasks*requestFactor.Value,
 		func() string { return fmt.Sprintf("doubleRead(tasks(%v)*%v)", numTasks, requestFactor) })
+}
+
+type CostItem interface {
+	IsConst() bool
+	GetCost() float64
+	AsFormula() string
+	GetName() string
 }
 
 type CostVer2Factor struct {
 	Name  string
 	Value float64
+}
+
+func (CostVer2Factor) IsConst() bool {
+	return true
+}
+
+func (f CostVer2Factor) GetCost() float64 {
+	return f.Value
+}
+
+func (f CostVer2Factor) AsFormula() string {
+	return f.Name
+}
+
+func (f CostVer2Factor) GetName() string {
+	return f.Name
 }
 
 func (f CostVer2Factor) String() string {
@@ -934,27 +948,29 @@ func (c CostVer2Factors) tolist() (l []CostVer2Factor) {
 	return append(l, c.TiDBTemp, c.TiKVScan, c.TiKVDescScan, c.TiFlashScan, c.TiDBCPU, c.TiKVCPU, c.TiFlashCPU,
 		c.TiDB2KVNet, c.TiDB2FlashNet, c.TiFlashMPPNet, c.TiDBMem, c.TiKVMem, c.TiFlashMem, c.TiDBDisk, c.TiDBRequest)
 }
+
 var constFactors map[string]float64
+
 const (
-	TiDBTemp=      "tidb_temp_table_factor"
-	TiKVScan=      "tikv_scan_factor"
-	TiKVDescScan=  "tikv_desc_scan_factor"
-	TiFlashScan=   "tiflash_scan_factor"
-	TiDBCPU=       "tidb_cpu_factor"
-	TiKVCPU=       "tikv_cpu_factor"
-	TiFlashCPU=    "tiflash_cpu_factor"
-	TiDB2KVNet=    "tidb_kv_net_factor"
-	TiDB2FlashNet= "tidb_flash_net_factor"
-	TiFlashMPPNet= "tiflash_mpp_net_factor"
-	TiDBMem=       "tidb_mem_factor"
-	TiKVMem=       "tikv_mem_factor"
-	TiFlashMem=    "tiflash_mem_factor"
-	TiDBDisk=      "tidb_disk_factor"
-	TiDBRequest=   "tidb_request_factor"
+	TiDBTemp      = "tidb_temp_table_factor"
+	TiKVScan      = "tikv_scan_factor"
+	TiKVDescScan  = "tikv_desc_scan_factor"
+	TiFlashScan   = "tiflash_scan_factor"
+	TiDBCPU       = "tidb_cpu_factor"
+	TiKVCPU       = "tikv_cpu_factor"
+	TiFlashCPU    = "tiflash_cpu_factor"
+	TiDB2KVNet    = "tidb_kv_net_factor"
+	TiDB2FlashNet = "tidb_flash_net_factor"
+	TiFlashMPPNet = "tiflash_mpp_net_factor"
+	TiDBMem       = "tidb_mem_factor"
+	TiKVMem       = "tikv_mem_factor"
+	TiFlashMem    = "tiflash_mem_factor"
+	TiDBDisk      = "tidb_disk_factor"
+	TiDBRequest   = "tidb_request_factor"
 )
 
 func initFactors() {
-	constFactors = make(map[string]float64,20)
+	constFactors = make(map[string]float64, 20)
 	constFactors[TiDBTemp] = 0.00
 	constFactors[TiKVScan] = 40.70
 	constFactors[TiKVDescScan] = 61.05
@@ -1108,160 +1124,258 @@ func newZeroCostVer2(_ bool) (ret CostVer2) {
 }
 
 type CostVer2 struct {
-	Name     string
-	Cost     float64
-	lastV    float64
-	lastOp   byte 
-	cascade  bool
-	factorCosts      map[string]float64 // map[factorName]cost, used to calibrate the cost model
-	subCost     map[string]*CostVer2
-	Formula     string             // It used to trace the cost calculation.
+	Name    string
+	Cost    float64
+	Formula string // It used to trace the cost calculation.
+	factors map[string]CostItem
 }
 
-func newCostVer2WithSubCost(name string, c *CostVer2) CostVer2 {
-	if c != nil {
-		ret := CostVer2{name, c.Cost, 0, 0, true, make(map[string]float64), make(map[string]*CostVer2), c.Name}
-		ret.subCost[c.Name] = c
-		return ret
-	}else {
-		ret := CostVer2{name, 0, 0, 0, true, make(map[string]float64), make(map[string]*CostVer2), ""}
-		return ret
+func (CostVer2) IsConst() bool {
+	return false
+}
+
+func (f *CostVer2) SetCost(v float64) {
+	f.Cost = v
+}
+
+func (f CostVer2) GetCost() float64 {
+	return f.Cost
+}
+
+func (f CostVer2) GetName() string {
+	return f.Name
+}
+
+func (c CostVer2) AsFormula() string {
+	if len(c.Name) > 0 {
+		return c.Name
+	}
+	return c.Formula
+}
+
+func (c *CostVer2) SetName(name string) {
+	c.Name = name
+}
+
+func newCostItem(name string, cost float64) CostItem {
+	return CostVer2Factor{Name: name, Value: cost}
+}
+
+func newCostVer2(formula string, cost float64) CostVer2 {
+	return CostVer2{Formula: formula, Cost: cost, factors: make(map[string]CostItem)}
+}
+
+const (
+	PLUS = '+'
+	SUB  = '-'
+	MUL  = '*'
+	DIV  = '/'
+	MULA = '0'
+	DIVA = '1'
+)
+
+type CostBuilder struct {
+	curr   *CostVer2 //point to new allocated CostVer2 during calculation, for name/cost/formula updating
+	init   CostItem  //save the init value, mainly for CostVer2Factor
+	lastV  float64
+	lastOp byte
+}
+
+func newCostBuilder(init CostItem) CostBuilder {
+	return CostBuilder{
+		init: init,
+		curr: nil,
 	}
 }
 
-func newCostVer2(option *PlanCostOption, factor CostVer2Factor, cost float64, lazyFormula func() string) (ret CostVer2) {
-	ret.Cost = cost
-	/*
-	if traceCost(option) {
-		ret.trace = &costTrace{make(map[string]float64), ""}
-		ret.trace.factorCosts[factor.Name] = cost
-		ret.trace.Formula = lazyFormula()
-	}
-	*/
-	return ret
+func (builder *CostBuilder) value() CostVer2 {
+	return *builder.curr
 }
 
-func newNamedCostVer2(name string, paramName string, cost float64) CostVer2 {
-	ret := CostVer2{name, 0, 0, 0, true, make(map[string]float64), make(map[string]*CostVer2), paramName}
-	ret.factorCosts[paramName] = cost
-	return ret
+func (builder *CostBuilder) setName(name string) *CostBuilder {
+	builder.curr.SetName(name)
+	return builder
 }
 
-func (c *CostVer2) getValue(param string) (float64, bool){
-	v,ok := c.factorCosts[param]; 
-	if !ok {
-		if v,ok = constFactors[param]; !ok {
-			return 0, ok 
-		}else if v, err := strconv.ParseFloat(param, 64); err == nil {
-			return v, true
-		} 
-	}
-	return v, true
-}
-
-func (c *CostVer2) PlusC(v *CostVer2) (*CostVer2){
-	c.Cost += v.Cost
-	if c.cascade {
-		if c.Formula != "" {
-			c.Formula += " + " + v.Name
-		} else {
-			c.Formula = v.Name
-		}
-		c.subCost[v.Name] = v
+func (builder *CostBuilder) calcCost(curOp byte, cost float64) float64 {
+	var curCost float64
+	if builder.curr != nil {
+		curCost = builder.curr.GetCost()
 	} else {
-		c.Formula += " + " + v.Formula
-		for k,v := range v.factorCosts {
-			c.addParam(k,v)
+		curCost = builder.init.GetCost()
+	}
+	switch curOp {
+	case PLUS:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		return curCost + cost
+	case SUB:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		return curCost - cost
+	case MULA:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		return curCost * cost
+	case DIVA:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		return curCost / cost
+	}
+
+	switch builder.lastOp {
+	case PLUS:
+		curCost -= builder.lastV
+		if curOp == MUL {
+			builder.lastV *= cost
+		} else if curOp == DIV {
+			builder.lastV /= cost
+		}
+		curCost += builder.lastV
+	case SUB:
+		curCost += builder.lastV
+		if curOp == MUL {
+			builder.lastV *= cost
+		} else if curOp == DIV {
+			builder.lastV /= cost
+		}
+		curCost -= builder.lastV
+	default:
+		if curOp == MUL {
+			curCost *= cost
+		} else if curOp == DIV {
+			curCost /= cost
 		}
 	}
-	return c
+	return curCost
 }
 
-func (c *CostVer2) Plus(param string) (*CostVer2){
-	if v,ok := c.getValue(param); ok {
-		c.Cost += v
-		c.Formula += " + " + param
-		c.lastV = v
-		c.lastOp = '+'
+func (builder *CostBuilder) opFinish(op byte, v CostItem, cost float64) {
+	var curFormula string
+	var formula string
+	if builder.curr != nil {
+		curFormula = builder.curr.AsFormula()
+	} else {
+		curFormula = builder.init.AsFormula()
 	}
-	return c
-}
-
-func (c *CostVer2) Dec(param string) (*CostVer2){
-	if v,ok := c.getValue(param); ok {
-		c.Cost -= v
-		c.Formula += " - " + param
-		c.lastV= v
-		c.lastOp = '-'
+	switch op {
+	case MULA:
+		formula = "(" + curFormula + ") * " + v.AsFormula()
+	case DIVA:
+		formula = "(" + curFormula + ") / " + v.AsFormula()
+	default:
+		formula = curFormula + " " + string(op) + " " + v.AsFormula()
 	}
-	return c
-}
+	// if v is constVer2, allocate new one as parent
+	if !v.IsConst() {
+		newCurr := newCostVer2(formula, cost)
+		//for CostVer2Factor or named CostVer2, we should add itself to factors,
+		//otherwise it's annoymous CostVer2, we should move it's params to the newCurr
+		if len(v.GetName()) > 0 {
+			newCurr.factors[v.AsFormula()] = v
+		} else {
+			cv := v.(CostVer2)
+			for k, v := range cv.factors {
+				newCurr.factors[k] = v
+			}
+		}
+		if builder.curr != nil {
+			//should handle builder.curr too, same logic with previous
+			if len(builder.curr.GetName()) > 0 {
+				newCurr.factors[builder.curr.AsFormula()] = *builder.curr
+			} else {
+				for k, v := range builder.curr.factors {
+					newCurr.factors[k] = v
+				}
+			}
+		} else {
+			newCurr.factors[builder.init.AsFormula()] = builder.init
+		}
 
-func (c *CostVer2) MulAll(param string) (*CostVer2){
-	if v,ok := c.getValue(param); ok {
-		c.Cost *= v
-		c.Formula ="(" + c.Formula + ") * " + param
-		c.lastV = v
-		c.lastOp = '*'
+		builder.curr = &newCurr
+	} else {
+		//if v is a cost item, only add to factors
+
+		//if builder.curr is null, create new costver2 to store factors
+		if builder.curr == nil {
+			newCurr := newCostVer2(formula, cost)
+			//add init to factors
+			newCurr.factors[builder.init.AsFormula()] = builder.init
+			builder.curr = &newCurr
+		} else {
+			//reuse curr, just update formula and cost
+			builder.curr.Formula = formula
+			builder.curr.Cost = cost
+		}
+		builder.curr.factors[v.AsFormula()] = v
 	}
-	return c
 }
 
-func (c *CostVer2) DivAll(param string) (*CostVer2){
-	if v,ok := c.getValue(param); ok {
-		c.Cost /= v
-		c.Formula ="(" + c.Formula + ") / " + param
-		c.lastV = v
-		c.lastOp = '/'
+func (builder *CostBuilder) sumAll(params ...CostItem) *CostBuilder {
+	for _, param := range params {
+		builder.plus(param)
 	}
-	return c
+	return builder
 }
 
-func (c *CostVer2) adjust() {
-	switch c.lastOp {
-	        case '+':
-			c.Cost -= c.lastV
-	        case '-':
-			c.Cost += c.lastV
-	}
+func (builder *CostBuilder) plus(v CostItem) *CostBuilder {
+	cost := builder.calcCost(PLUS, v.GetCost())
+	builder.opFinish(PLUS, v, cost)
+	return builder
 }
 
-func (c *CostVer2) Mul(param string) (*CostVer2){
-	if v,ok := c.getValue(param); ok {
-		c.adjust()
-		c.Cost += c.lastV * v
-		c.Formula += " * " + param
-		c.lastV = c.lastV * v
-		//don't change lastOp since it should be revert value if lastOp is +/-
-	}
-	return c
+func (builder *CostBuilder) sub(v CostItem) *CostBuilder {
+	cost := builder.calcCost(SUB, v.GetCost())
+	builder.opFinish(SUB, v, cost)
+	return builder
 }
 
-func (c *CostVer2) Div(param string) (*CostVer2){
-	if v,ok := c.getValue(param); ok {
-		c.adjust()
-		c.Cost += c.lastV/v
-		c.Formula += " / " + param
-		c.lastV = c.lastV/v
-		//don't change lastOp since it should be revert value if lastOp is +/-
-	}
-	return c
+func (builder *CostBuilder) div(v CostItem) *CostBuilder {
+	cost := builder.calcCost(DIV, v.GetCost())
+	builder.opFinish(DIV, v, cost)
+	return builder
 }
 
-func (c *CostVer2) addParam(name string, cost float64){
-	c.factorCosts[name] = cost
+func (builder *CostBuilder) mul(v CostItem) *CostBuilder {
+	cost := builder.calcCost(MUL, v.GetCost())
+	builder.opFinish(MUL, v, cost)
+	return builder
+}
+
+func (builder *CostBuilder) mulA(v CostItem) *CostBuilder {
+	cost := builder.calcCost(MULA, v.GetCost())
+	builder.opFinish(MULA, v, cost)
+	return builder
+}
+
+func (builder *CostBuilder) divA(v CostItem) *CostBuilder {
+	cost := builder.calcCost(DIVA, v.GetCost())
+	builder.opFinish(DIVA, v, cost)
+	return builder
 }
 
 func sumCostVer2(costs ...CostVer2) (ret CostVer2) {
-	return 
+	return
 }
 
 func divCostVer2(cost CostVer2, denominator float64) (ret CostVer2) {
-	return 
+	return
 }
 
 func mulCostVer2(Cost CostVer2, scale float64) (ret CostVer2) {
 	return
+}
+
+func newOldCostVer2(option *PlanCostOption, factor CostVer2Factor, cost float64, lazyFormula func() string) (ret CostVer2) {
+	ret.Cost = cost
+	/*
+		if traceCost(option) {
+			ret.trace = &costTrace{make(map[string]float64), ""}
+			ret.trace.factorCosts[factor.Name] = cost
+			ret.trace.Formula = lazyFormula()
+		}
+	*/
+	return ret
 }
 
 var zeroCostVer2 = newZeroCostVer2(false)

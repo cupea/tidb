@@ -798,20 +798,23 @@ func (e *Explain) RenderResult() error {
 				// output cost formula and factor costs through warning under model ver2 and true_card_cost mode for cost calibration.
 				trace, _ := pp.getPlanCostVer2(property.RootTaskType, NewDefaultPlanCostOption())
 				pp.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("cost formula: %v", trace.Formula))
-				data, err := json.Marshal(trace.factorCosts)
+				data, err := json.Marshal(trace.factors)
 				if err != nil {
 					pp.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("marshal factor costs error %v", err))
 				}
 				pp.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("factor costs: %v", string(data)))
 
-				// output cost factor weights for cost calibration
-				factors := defaultVer2Factors.tolist()
 				weights := make(map[string]float64)
-				for _, factor := range factors {
-					if factorCost, ok := trace.factorCosts[factor.Name]; ok && factor.Value > 0 {
-						weights[factor.Name] = factorCost / factor.Value // cost = [factors] * [weights]
+				// output cost factor weights for cost calibration
+				// xsong todo fix cost
+				//factors := defaultVer2Factors.tolist()
+				/*
+					for _, factor := range factors {
+						if factorCost, ok := trace.factorCosts[factor.Name]; ok && factor.Value > 0 {
+							weights[factor.Name] = factorCost / factor.Value // cost = [factors] * [weights]
+						}
 					}
-				}
+				*/
 				if wstr, err := json.Marshal(weights); err != nil {
 					pp.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("marshal weights error %v", err))
 				} else {

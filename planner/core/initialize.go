@@ -15,7 +15,6 @@
 package core
 
 import (
-	"fmt"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/planner/property"
