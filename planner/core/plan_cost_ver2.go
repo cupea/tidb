@@ -110,7 +110,7 @@ func (p *PhysicalSelection) getPlanCostVer2(taskType property.TaskType, option *
 	}
 
 	builder.plus(childCost).setName(p.ExplainID().String())
-	p.planCostVer2 = builder.value()
+	p.planCostVer2 = builder.Value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -136,7 +136,7 @@ func (p *PhysicalProjection) getPlanCostVer2(taskType property.TaskType, option 
 	}
 
 	builder.plus(childCost).setName(p.ExplainID().String())
-	p.planCostVer2 = builder.value()
+	p.planCostVer2 = builder.Value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -159,7 +159,7 @@ func (p *PhysicalIndexScan) getPlanCostVer2(taskType property.TaskType, option *
 	scanFactor := getTaskScanFactorVer2(p, kv.TiKV, taskType)
 	builder.mul(scanFactor).mul(rowSizeCost).setName(p.ExplainID().String())
 
-	p.planCostVer2 = builder.value()
+	p.planCostVer2 = builder.Value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -192,7 +192,7 @@ func (p *PhysicalTableScan) getPlanCostVer2(taskType property.TaskType, option *
 		builder.plus(nbuilder.curr)
 	}
 	builder.setName(p.ExplainID().String())
-	p.planCostVer2 = builder.value()
+	p.planCostVer2 = builder.Value()
 	p.planCostInit = true
 	return p.planCostVer2, nil
 }
@@ -580,13 +580,13 @@ func (p *PhysicalHashJoin) getPlanCostVer2(taskType property.TaskType, option *P
 
 	if taskType == property.MppTaskType { // BCast or Shuffle Join, use mppConcurrency
 		builder.sumAll(hashBuilder.curr, probeFilterBuilder.curr, probeHashBuilder.curr).divA(mppConcurrency).setName("probeCost").sumAll(buildChildCost, probeChildCost).setName(p.ExplainID().String())
-		p.planCostVer2 = builder.value()
+		p.planCostVer2 = builder.Value()
 	} else { // TiDB HashJoin
 		probeFilterBuilder.plus(probeHashBuilder.curr).divA(tidbConcurrency).setName("probeCost")
 		startCostBuilder := newCostBuilder(cpuFactor)
 		startCostBuilder.mul(newCostItem("10", 10)).mul(newCostItem("3", 3)).setName("startCost")
 		probeFilterBuilder.sumAll(startCostBuilder.curr, buildChildCost, probeChildCost, hashBuilder.curr, builder.curr).setName(p.ExplainID().String())
-		p.planCostVer2 = probeFilterBuilder.value()
+		p.planCostVer2 = probeFilterBuilder.Value()
 	}
 	p.planCostInit = true
 	return p.planCostVer2, nil
@@ -1157,6 +1157,10 @@ func (c *CostVer2) SetName(name string) {
 	c.Name = name
 }
 
+func GetCostItem(name string, cost float64) CostItem {
+	return newCostItem(name, cost)
+}
+
 func newCostItem(name string, cost float64) CostItem {
 	return CostVer2Factor{Name: name, Value: cost}
 }
@@ -1181,6 +1185,37 @@ type CostBuilder struct {
 	lastOp byte
 }
 
+// for test only
+func GetCostBuilderForTest(init CostItem) *CostBuilder {
+	return &CostBuilder{
+		init: init,
+		curr: nil,
+	}
+}
+
+// for test only
+func (builder *CostBuilder) EvalOpForTest(op string, v CostItem) {
+	switch op {
+	case "+":
+		builder.plus(v)
+	case "-":
+		builder.sub(v)
+	case "*":
+		builder.mul(v)
+	case "/":
+		builder.div(v)
+	case ")*":
+		builder.mulA(v)
+	case ")/":
+		builder.divA(v)
+	}
+}
+
+// for test only
+func (builder *CostBuilder) SetNameForTest(name string) *CostBuilder {
+	return builder.setName(name)
+}
+
 func newCostBuilder(init CostItem) CostBuilder {
 	return CostBuilder{
 		init: init,
@@ -1188,7 +1223,7 @@ func newCostBuilder(init CostItem) CostBuilder {
 	}
 }
 
-func (builder *CostBuilder) value() CostVer2 {
+func (builder *CostBuilder) Value() CostVer2 {
 	return *builder.curr
 }
 
@@ -1250,21 +1285,30 @@ func (builder *CostBuilder) calcCost(curOp byte, cost float64) float64 {
 	return curCost
 }
 
+func isAnnoymous(v CostItem) bool {
+	return !v.IsConst() && len(v.GetName()) == 0
+}
+
 func (builder *CostBuilder) opFinish(op byte, v CostItem, cost float64) {
 	var curFormula string
 	var formula string
+	vformula := v.AsFormula()
 	if builder.curr != nil {
 		curFormula = builder.curr.AsFormula()
 	} else {
 		curFormula = builder.init.AsFormula()
 	}
+	//if annoymous CostVer2, should add "()", otherwise formula is incorrect
+	if isAnnoymous(v) {
+		vformula = "( " + vformula + " )"
+	}
 	switch op {
 	case MULA:
-		formula = "(" + curFormula + ") * " + v.AsFormula()
+		formula = "( " + curFormula + " )* " + vformula
 	case DIVA:
-		formula = "(" + curFormula + ") / " + v.AsFormula()
+		formula = "( " + curFormula + " )/ " + vformula
 	default:
-		formula = curFormula + " " + string(op) + " " + v.AsFormula()
+		formula = curFormula + " " + string(op) + " " + vformula
 	}
 	// if v is constVer2, allocate new one as parent
 	if !v.IsConst() {
