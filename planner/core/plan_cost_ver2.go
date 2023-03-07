@@ -845,12 +845,45 @@ func doubleReadCostVer2(option *PlanCostOption, numTasks float64, requestFactor 
 		func() string { return fmt.Sprintf("doubleRead(tasks(%v)*%v)", numTasks, requestFactor) })
 }
 
+type CostItem interface {
+	IsConst() bool
+	GetCost() float64
+	SetCost(v float64)
+	AsFormula() string
+	GetName() string
+	SetName(v string)
+}
+
 type costVer2Factor struct {
 	Name  string
 	Value float64
 }
 
-func (f costVer2Factor) String() string {
+func (costVer2Factor) IsConst() bool {
+	return true
+}
+
+func (f *costVer2Factor) GetCost() float64 {
+	return f.Value
+}
+
+func (f *costVer2Factor) SetCost(v float64) {
+	f.Value = v
+}
+
+func (f *costVer2Factor) AsFormula() string {
+	return f.Name
+}
+
+func (f *costVer2Factor) GetName() string {
+	return f.Name
+}
+
+func (f *costVer2Factor) SetName(v string) {
+	f.Name = v
+}
+
+func (f *costVer2Factor) String() string {
 	return fmt.Sprintf("%s(%v)", f.Name, f.Value)
 }
 
@@ -1008,22 +1041,297 @@ type costTrace struct {
 }
 
 type costVer2 struct {
-	cost  float64
-	trace *costTrace
+	name    string
+	cost    float64
+	formula string // It used to trace the cost calculation.
+	factors map[string]CostItem
+
+	trace *costTrace // for build pass currently, will be removed in future
 }
 
-func traceCost(option *PlanCostOption) bool {
-	if option != nil && hasCostFlag(option.CostFlag, CostFlagTrace) {
-		return true
-	}
+func (costVer2) IsConst() bool {
 	return false
 }
 
-func newZeroCostVer2(trace bool) (ret costVer2) {
-	if trace {
-		ret.trace = &costTrace{make(map[string]float64), ""}
+func (c *costVer2) SetCost(v float64) {
+	c.cost = v
+}
+
+func (c *costVer2) GetCost() float64 {
+	return c.cost
+}
+
+func (c *costVer2) GetName() string {
+	return c.name
+}
+
+func (c *costVer2) AsFormula() string {
+	if len(c.name) > 0 {
+		return c.name
 	}
-	return
+	return c.formula
+}
+
+func (c *costVer2) SetName(name string) {
+	c.name = name
+}
+
+func newCostItem(name string, cost float64) CostItem {
+	return &costVer2Factor{Name: name, Value: cost}
+}
+
+func newCostVer2New(formula string, cost float64) *costVer2 {
+	return &costVer2{formula: formula, cost: cost, factors: make(map[string]CostItem)}
+}
+
+const (
+	PLUS = '+'
+	SUB  = '-'
+	MUL  = '*'
+	DIV  = '/'
+	MULA = '0'
+	DIVA = '1'
+)
+
+// CostBuilder use to calculate cost and generate formula
+type CostBuilder struct {
+	curr    CostItem
+	lastV   float64
+	lastOp  byte
+	isTrace bool
+}
+
+func newCostBuilder(init CostItem, isTrace bool) *CostBuilder {
+	return &CostBuilder{
+		curr:    init,
+		isTrace: isTrace,
+	}
+}
+
+func (builder *CostBuilder) Value() CostItem {
+	return builder.curr
+}
+
+func (builder *CostBuilder) setName(name string) *CostBuilder {
+	if !builder.curr.IsConst() {
+		// for costVer2, if setName called, we will treat curr as an entity, think "a + b * c" named plan1Cost, "c + d * e" named plan2Cost, plan1Cost.mul(plan2Cost), the formula will be "plan1Cost * plan2Cost", but if we don't treat as an entity, the cost will be "a + b * c * (c + d * e)", got an incorrect result. so we should clear lastOp and lastV to get correct result
+		builder.lastOp = 0
+		builder.lastV = 0
+	}
+	builder.curr.SetName(name)
+	return builder
+}
+
+// calcCost use to calc cost
+func (builder *CostBuilder) calcCost(curOp byte, cost float64) float64 {
+	var curCost float64
+	curCost = builder.curr.GetCost()
+
+	switch curOp {
+	case PLUS:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		builder.curr.SetCost(curCost + cost)
+		return builder.curr.GetCost()
+	case SUB:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		builder.curr.SetCost(curCost - cost)
+		return builder.curr.GetCost()
+	case MULA:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		builder.curr.SetCost(curCost * cost)
+		return builder.curr.GetCost()
+	case DIVA:
+		builder.lastV = cost
+		builder.lastOp = curOp
+		builder.curr.SetCost(curCost / cost)
+		return builder.curr.GetCost()
+	}
+	// We should do special action here. for example "a + b * c", we already calc the cost, and then mul("d") called, if using cost * d, the formula is "(a + b * c) * d", but "a + b * c * d" is expected. so I use lastV to record value since last +/-, lastV is "b * c" in this example, when mul/div called, firstly cost +/- lastV("b * c"), then cost -/+ lastV*d("b * c * d")
+	switch builder.lastOp {
+	case PLUS:
+		curCost -= builder.lastV
+		if curOp == MUL {
+			builder.lastV *= cost
+		} else if curOp == DIV {
+			builder.lastV /= cost
+		}
+		curCost += builder.lastV
+	case SUB:
+		curCost += builder.lastV
+		if curOp == MUL {
+			builder.lastV *= cost
+		} else if curOp == DIV {
+			builder.lastV /= cost
+		}
+		curCost -= builder.lastV
+	default:
+		if curOp == MUL {
+			curCost *= cost
+		} else if curOp == DIV {
+			curCost /= cost
+		}
+	}
+	builder.curr.SetCost(curCost)
+	return curCost
+}
+
+// isAnnoymous check whether CostItem have name or not, if no name, the formula will be complicated
+func isAnnoymous(v CostItem) bool {
+	return !v.IsConst() && len(v.GetName()) == 0
+}
+
+// opFinish use to generate formula
+func (builder *CostBuilder) opFinish(op byte, v CostItem, cost float64) {
+	// if trace not enabled, skip to calc formula
+	if !builder.isTrace {
+		return
+	}
+
+	var formula string
+
+	curFormula := builder.curr.AsFormula()
+	vformula := v.AsFormula()
+	// if not a named CostVer2, should add "()", otherwise formula is incorrect
+	if isAnnoymous(v) {
+		vformula = "( " + vformula + " )"
+	}
+
+	switch op {
+	case MULA:
+		if isAnnoymous(builder.curr) {
+			curFormula = "( " + curFormula + " )"
+		}
+		formula = curFormula + " * " + vformula
+	case DIVA:
+		if isAnnoymous(builder.curr) {
+			curFormula = "( " + curFormula + " )"
+		}
+		formula = curFormula + " / " + vformula
+	default:
+		formula = curFormula + " " + string(op) + " " + vformula
+	}
+
+	// if v is costVer2, allocate new one as parent
+	if !v.IsConst() {
+		newCurr := newCostVer2New(formula, cost)
+		// for costVer2Factor or named costVer2, we should add itself to factors,
+		// otherwise we should move it's params to the newCurr
+		if len(v.GetName()) > 0 {
+			newCurr.factors[v.AsFormula()] = v
+		} else {
+			cv := v.(*costVer2)
+			for k, v := range cv.factors {
+				newCurr.factors[k] = v
+			}
+		}
+
+		// same logic with previous to handle builder.curr
+		if len(builder.curr.GetName()) > 0 {
+			newCurr.factors[builder.curr.AsFormula()] = builder.curr
+		} else if !builder.curr.IsConst() {
+			cv := builder.curr.(*costVer2)
+			for k, v := range cv.factors {
+				newCurr.factors[k] = v
+			}
+		}
+
+		builder.curr = newCurr
+	} else {
+		// if v is a const item, only add to factors
+
+		// if builder.curr is a cost item, create new costver2 to store factors
+		if builder.curr.IsConst() {
+			newCurr := newCostVer2New(formula, cost)
+			// add curr to factors
+			newCurr.factors[builder.curr.AsFormula()] = builder.curr
+			newCurr.factors[v.AsFormula()] = v
+			builder.curr = newCurr
+		} else {
+			// just update formula and factors, cost already updated in calcCost
+			cv := builder.curr.(*costVer2)
+			cv.formula = formula
+			cv.factors[v.AsFormula()] = v
+		}
+	}
+}
+
+func (builder *CostBuilder) sumAll(params ...CostItem) *CostBuilder {
+	for _, param := range params {
+		builder.plus(param)
+	}
+	return builder
+}
+
+func (builder *CostBuilder) plus(v CostItem) *CostBuilder {
+	cost := builder.calcCost(PLUS, v.GetCost())
+	builder.opFinish(PLUS, v, cost)
+	return builder
+}
+
+func (builder *CostBuilder) sub(v CostItem) *CostBuilder {
+	cost := builder.calcCost(SUB, v.GetCost())
+	builder.opFinish(SUB, v, cost)
+	return builder
+}
+
+func (builder *CostBuilder) mul(v CostItem) *CostBuilder {
+	cost := builder.calcCost(MUL, v.GetCost())
+	builder.opFinish(MUL, v, cost)
+	return builder
+}
+
+func (builder *CostBuilder) div(v CostItem) *CostBuilder {
+	cost := builder.calcCost(DIV, v.GetCost())
+	builder.opFinish(DIV, v, cost)
+	return builder
+}
+
+func (builder *CostBuilder) mulA(v CostItem) *CostBuilder {
+	cost := builder.calcCost(MULA, v.GetCost())
+	builder.opFinish(MULA, v, cost)
+	return builder
+}
+
+func (builder *CostBuilder) divA(v CostItem) *CostBuilder {
+	cost := builder.calcCost(DIVA, v.GetCost())
+	builder.opFinish(DIVA, v, cost)
+	return builder
+}
+
+// for test only
+func GetCostBuilderForTest(init CostItem, isTrace bool) *CostBuilder {
+	return newCostBuilder(init, isTrace)
+}
+
+// for test only
+func (builder *CostBuilder) EvalOpForTest(op string, v CostItem) {
+	switch op {
+	case "+":
+		builder.plus(v)
+	case "-":
+		builder.sub(v)
+	case "*":
+		builder.mul(v)
+	case "/":
+		builder.div(v)
+	case ")*":
+		builder.mulA(v)
+	case ")/":
+		builder.divA(v)
+	}
+}
+
+// for test only
+func (builder *CostBuilder) SetNameForTest(name string) *CostBuilder {
+	return builder.setName(name)
+}
+
+// for test only
+func NewCostItemForTest(name string, cost float64) CostItem {
+	return newCostItem(name, cost)
 }
 
 func newCostVer2(option *PlanCostOption, factor costVer2Factor, cost float64, lazyFormula func() string) (ret costVer2) {
@@ -1068,6 +1376,20 @@ func divCostVer2(cost costVer2, denominator float64) (ret costVer2) {
 		ret.trace.formula = "(" + cost.trace.formula + ")/" + strconv.FormatFloat(denominator, 'f', 2, 64)
 	}
 	return ret
+}
+
+func traceCost(option *PlanCostOption) bool {
+	if option != nil && hasCostFlag(option.CostFlag, CostFlagTrace) {
+		return true
+	}
+	return false
+}
+
+func newZeroCostVer2(trace bool) (ret costVer2) {
+	if trace {
+		ret.trace = &costTrace{make(map[string]float64), ""}
+	}
+	return
 }
 
 func mulCostVer2(cost costVer2, scale float64) (ret costVer2) {
